@@ -1,7 +1,7 @@
 #include <iostream>
 
 #include "orderbook/feed_parser.h"
-#include "orderbook/order_book.h"
+#include "orderbook/tree_order_book.h"
 
 int main(int argc, char** argv) {
     if (argc != 2) {
@@ -10,7 +10,7 @@ int main(int argc, char** argv) {
     }
 
     orderbook::FeedParser parser(argv[1]);
-    orderbook::OrderBook book;
+    orderbook::TreeOrderBook book;
     orderbook::OrderEvent event{};
 
     uint64_t events_applied = 0;
