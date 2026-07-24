@@ -11,7 +11,9 @@ endif()
 
 add_library(orderbook_core
   src/feed_parser.cpp
-  src/order_book.cpp
+  src/tree_order_book.cpp
+  src/flat_order_book.cpp
+  src/heap_order_book.cpp
 )
 target_include_directories(orderbook_core PUBLIC include)
 target_compile_options(orderbook_core PUBLIC
@@ -25,7 +27,10 @@ target_link_libraries(orderbook_replay PRIVATE orderbook_core)
 add_executable(orderbook_tests
   tests/test_main.cpp
   tests/test_feed_parser.cpp
-  tests/test_order_book.cpp
+  tests/test_tree_order_book.cpp
+  tests/test_flat_order_book.cpp
+  tests/test_heap_order_book.cpp
+  tests/test_engine_parity.cpp
 )
 target_include_directories(orderbook_tests PRIVATE tests)
 target_link_libraries(orderbook_tests PRIVATE orderbook_core)
