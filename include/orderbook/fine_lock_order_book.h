@@ -14,9 +14,15 @@ namespace orderbook {
 
 // One mutex per price level, plus separate mutexes for the best-index cache and the pool free list
 // Lock order: best_mutex_ -> level -> pool_mutex_
+//
+// cancelOrder must read an order's side/price before it knows which level's
+// mutex to take, and slots get reused (unlike LockFreeOrderBook's grow-only
+// pool) -- so side/price/id_to_slot_ are atomic, and cancelOrder re-validates
+// under the level lock before mutating, in case the order was concurrently
+// filled and its slot freed/reused in the gap. Callers still must never
+// touch the same order_id from two threads at once themselves.
 class FineLockOrderBook {
 public:
-    // callers must never touch the same order_id from two threads at once
     FineLockOrderBook(int64_t min_price, size_t price_range, size_t pool_capacity, uint64_t max_order_id);
 
     std::vector<Trade> apply(const OrderEvent& event);
@@ -34,10 +40,10 @@ private:
 
     struct PooledOrder {
         uint64_t order_id;
-        int64_t price;
+        std::atomic<int64_t> price;
         uint32_t quantity;
         uint64_t timestamp_ns;
-        Side side;
+        std::atomic<Side> side;
         uint32_t prev;
         uint32_t next;  // free-list link when the slot is unused
     };
@@ -75,7 +81,7 @@ private:
     std::vector<PooledOrder> pool_;
     uint32_t free_head_ = kNil;
 
-    std::vector<uint32_t> id_to_slot_;
+    std::vector<std::atomic<uint32_t>> id_to_slot_;
 };
 
 } // namespace orderbook
