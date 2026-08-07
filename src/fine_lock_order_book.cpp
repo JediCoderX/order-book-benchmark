@@ -11,11 +11,14 @@ FineLockOrderBook::FineLockOrderBook(int64_t min_price, size_t price_range, size
       bid_levels_(price_range),
       ask_levels_(price_range),
       pool_(pool_capacity),
-      id_to_slot_(max_order_id, kNil) {
+      id_to_slot_(max_order_id) {
     for (size_t i = 0; i < pool_capacity; ++i) {
         pool_[i].next = (i + 1 < pool_capacity) ? static_cast<uint32_t>(i + 1) : kNil;
     }
     free_head_ = pool_capacity > 0 ? 0 : kNil;
+    for (auto& slot : id_to_slot_) {
+        slot.store(kNil, std::memory_order_relaxed);
+    }
 }
 
 uint32_t FineLockOrderBook::allocateSlot() {
@@ -80,8 +83,15 @@ void FineLockOrderBook::advanceBestBid(int64_t from_idx) {
 void FineLockOrderBook::rest(Side side, int64_t price, uint64_t order_id, uint32_t quantity, uint64_t timestamp_ns) {
     int64_t idx = price - min_price_;
     uint32_t slot = allocateSlot();
-    pool_[slot] = PooledOrder{order_id, price, quantity, timestamp_ns, side, kNil, kNil};
-    id_to_slot_[order_id] = slot;
+    PooledOrder& order = pool_[slot];
+    order.order_id = order_id;
+    order.price.store(price, std::memory_order_relaxed);
+    order.quantity = quantity;
+    order.timestamp_ns = timestamp_ns;
+    order.side.store(side, std::memory_order_relaxed);
+    order.prev = kNil;
+    order.next = kNil;
+    id_to_slot_[order_id].store(slot, std::memory_order_release);
 
     if (side == Side::Buy) {
         PriceLevel& level = bid_levels_[idx];
@@ -145,7 +155,7 @@ std::vector<Trade> FineLockOrderBook::addOrder(uint64_t order_id, Side side, int
                     level.total_quantity -= traded;
                     if (maker.quantity == 0) {
                         unlink(level, maker_slot);
-                        id_to_slot_[maker.order_id] = kNil;
+                        id_to_slot_[maker.order_id].store(kNil, std::memory_order_release);
                         freeSlot(maker_slot);
                     }
                 }
@@ -183,7 +193,7 @@ std::vector<Trade> FineLockOrderBook::addOrder(uint64_t order_id, Side side, int
                     level.total_quantity -= traded;
                     if (maker.quantity == 0) {
                         unlink(level, maker_slot);
-                        id_to_slot_[maker.order_id] = kNil;
+                        id_to_slot_[maker.order_id].store(kNil, std::memory_order_release);
                         freeSlot(maker_slot);
                     }
                 }
@@ -205,26 +215,38 @@ std::vector<Trade> FineLockOrderBook::addOrder(uint64_t order_id, Side side, int
 }
 
 bool FineLockOrderBook::cancelOrder(uint64_t order_id) {
-    if (order_id >= id_to_slot_.size() || id_to_slot_[order_id] == kNil) {
+    if (order_id >= id_to_slot_.size()) {
+        return false;
+    }
+    uint32_t slot = id_to_slot_[order_id].load(std::memory_order_acquire);
+    if (slot == kNil) {
         return false;
     }
 
-    uint32_t slot = id_to_slot_[order_id];
-    Side side = pool_[slot].side;
-    int64_t price = pool_[slot].price;
-    uint32_t qty = pool_[slot].quantity;
+    // side/price are just a starting guess for which lock to take -- the
+    // slot could be concurrently filled and reused before we get the lock,
+    // so nothing here is trusted until the id_to_slot_ check below passes.
+    Side side = pool_[slot].side.load(std::memory_order_acquire);
+    int64_t price = pool_[slot].price.load(std::memory_order_acquire);
     int64_t idx = price - min_price_;
 
     bool drained_empty;
+    bool still_valid;
     if (side == Side::Buy) {
         PriceLevel& level = bid_levels_[idx];
         {
             std::lock_guard<std::mutex> lock(level.mutex);
-            level.total_quantity -= qty;
-            unlink(level, slot);
-            drained_empty = (level.head == kNil);
+            still_valid = (id_to_slot_[order_id].load(std::memory_order_acquire) == slot);
+            if (still_valid) {
+                level.total_quantity -= pool_[slot].quantity;
+                unlink(level, slot);
+                drained_empty = (level.head == kNil);
+            }
         }
-        id_to_slot_[order_id] = kNil;
+        if (!still_valid) {
+            return false;  // filled concurrently between our read and the lock
+        }
+        id_to_slot_[order_id].store(kNil, std::memory_order_release);
         freeSlot(slot);
         if (drained_empty) {
             std::lock_guard<std::mutex> lock(best_mutex_);
@@ -236,11 +258,17 @@ bool FineLockOrderBook::cancelOrder(uint64_t order_id) {
         PriceLevel& level = ask_levels_[idx];
         {
             std::lock_guard<std::mutex> lock(level.mutex);
-            level.total_quantity -= qty;
-            unlink(level, slot);
-            drained_empty = (level.head == kNil);
+            still_valid = (id_to_slot_[order_id].load(std::memory_order_acquire) == slot);
+            if (still_valid) {
+                level.total_quantity -= pool_[slot].quantity;
+                unlink(level, slot);
+                drained_empty = (level.head == kNil);
+            }
         }
-        id_to_slot_[order_id] = kNil;
+        if (!still_valid) {
+            return false;
+        }
+        id_to_slot_[order_id].store(kNil, std::memory_order_release);
         freeSlot(slot);
         if (drained_empty) {
             std::lock_guard<std::mutex> lock(best_mutex_);
@@ -253,11 +281,17 @@ bool FineLockOrderBook::cancelOrder(uint64_t order_id) {
 }
 
 std::vector<Trade> FineLockOrderBook::modifyOrder(uint64_t order_id, int64_t new_price, uint32_t new_quantity, uint64_t timestamp_ns) {
-    if (order_id >= id_to_slot_.size() || id_to_slot_[order_id] == kNil) {
+    if (order_id >= id_to_slot_.size()) {
         return {};
     }
-    Side side = pool_[id_to_slot_[order_id]].side;
-    cancelOrder(order_id);
+    uint32_t slot = id_to_slot_[order_id].load(std::memory_order_acquire);
+    if (slot == kNil) {
+        return {};
+    }
+    Side side = pool_[slot].side.load(std::memory_order_acquire);
+    if (!cancelOrder(order_id)) {
+        return {};  // already gone (raced with a concurrent fill)
+    }
     return addOrder(order_id, side, new_price, new_quantity, timestamp_ns);
 }
 
