@@ -1,3 +1,4 @@
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -114,4 +115,61 @@ TEST(fine_lock_survives_concurrent_access_from_multiple_threads) {
         }
     }
     CHECK_EQ(*book.bestBid(), best_occupied_price);
+}
+
+// The case that exposed a real bug: many "maker" threads resting sell
+// orders at the SAME price, then many "taker" threads concurrently
+// crossing against that same level at once. cancelOrder isn't exercised
+// here directly, but this is exactly the cross-thread-matching shape
+// (a slot getting filled by one thread while another thread might still
+// reference it) that disjoint-lane tests can never trigger.
+TEST(fine_lock_survives_concurrent_matching_on_shared_price_level) {
+    constexpr int kMakerThreads = 4;
+    constexpr int kTakerThreads = 4;
+    constexpr uint64_t kOrdersPerMaker = 2000;
+    constexpr uint32_t kQuantity = 10;
+    constexpr int64_t kPrice = 500;
+
+    FineLockOrderBook book(0, 1000, (kMakerThreads + kTakerThreads) * kOrdersPerMaker + 10,
+                            (kMakerThreads + kTakerThreads) * kOrdersPerMaker + 10);
+
+    std::vector<std::thread> makers;
+    for (int t = 0; t < kMakerThreads; ++t) {
+        makers.emplace_back([&book, t]() {
+            uint64_t base_id = static_cast<uint64_t>(t) * kOrdersPerMaker;
+            for (uint64_t i = 0; i < kOrdersPerMaker; ++i) {
+                book.addOrder(base_id + i, Side::Sell, kPrice, kQuantity, 0);
+            }
+        });
+    }
+    for (auto& th : makers) {
+        th.join();
+    }
+
+    uint64_t total_supply = static_cast<uint64_t>(kMakerThreads) * kOrdersPerMaker * kQuantity;
+    CHECK_EQ(book.quantityAt(Side::Sell, kPrice), static_cast<uint32_t>(total_supply));
+
+    std::atomic<uint64_t> total_traded{0};
+    std::vector<std::thread> takers;
+    for (int t = 0; t < kTakerThreads; ++t) {
+        takers.emplace_back([&book, t, &total_traded]() {
+            uint64_t base_id = static_cast<uint64_t>(kMakerThreads) * kOrdersPerMaker +
+                                static_cast<uint64_t>(t) * kOrdersPerMaker;
+            for (uint64_t i = 0; i < kOrdersPerMaker; ++i) {
+                auto trades = book.addOrder(base_id + i, Side::Buy, kPrice, kQuantity, 0);
+                uint64_t filled = 0;
+                for (const auto& trade : trades) {
+                    filled += trade.quantity;
+                }
+                total_traded.fetch_add(filled, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& th : takers) {
+        th.join();
+    }
+
+    CHECK_EQ(total_traded.load(), total_supply);
+    CHECK_EQ(book.quantityAt(Side::Sell, kPrice), 0u);
+    CHECK(!book.bestAsk().has_value());
 }
