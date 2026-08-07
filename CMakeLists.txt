@@ -30,6 +30,9 @@ target_link_libraries(orderbook_core PUBLIC Threads::Threads)
 add_executable(orderbook_replay src/main.cpp)
 target_link_libraries(orderbook_replay PRIVATE orderbook_core)
 
+add_executable(orderbook_benchmark src/benchmark.cpp)
+target_link_libraries(orderbook_benchmark PRIVATE orderbook_core)
+
 add_executable(orderbook_tests
   tests/test_main.cpp
   tests/test_feed_parser.cpp
